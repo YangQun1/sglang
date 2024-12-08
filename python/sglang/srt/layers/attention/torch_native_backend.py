@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from torch.nn.attention.bias import causal_lower_right
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.layers.attention import AttentionBackend
@@ -18,6 +19,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        self.sdpa_kernel = scaled_dot_product_attention
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -59,6 +61,9 @@ class TorchNativeAttnBackend(AttentionBackend):
         raise ValueError(
             "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
         )
+
+    def _create_attn_mask(self, bs, num_heads, q_len, k_len, device):
+        return causal_lower_right(q_len, k_len)
 
     def _run_sdpa_forward_extend(
         self,
@@ -114,13 +119,17 @@ class TorchNativeAttnBackend(AttentionBackend):
             end_kv = start_kv + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
-                dtype=per_req_query.dtype,
-                device=per_req_query.device,
-            )
 
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
+            if causal:
+                mask = self._create_attn_mask(
+                    1,
+                    per_req_query.shape[0],
+                    extend_seq_len_q,
+                    seq_len_kv,
+                    per_req_query.device,
+                )
+            else:
+                mask = None
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
@@ -129,19 +138,19 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            per_req_out_redudant = (
-                scaled_dot_product_attention(
-                    per_req_query_redudant.unsqueeze(0),
+            per_req_out = (
+                self.sdpa_kernel(
+                    per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
+                    attn_mask=mask,
                     enable_gqa=enable_gqa,
                     scale=scaling,
-                    is_causal=causal,
                 )
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
+            output[start_q:end_q, :, :] = per_req_out
             start_q, start_kv = end_q, end_kv
         return output
 
@@ -199,7 +208,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
             per_req_out = (
-                scaled_dot_product_attention(
+                self.sdpa_kernel(
                     per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
