@@ -154,6 +154,119 @@ class TorchNativeAttnBackend(AttentionBackend):
             start_q, start_kv = end_q, end_kv
         return output
 
+    def _run_sdpa_forward_extend_with_padding(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        scaling=None,
+        enable_gqa=False,
+        causal=False,
+    ):
+        """Run the extend forward by using torch native sdpa op.
+        We will pad the sequences in the batch to the max length.
+
+        Args:
+            query: [num_tokens, num_heads, head_size]
+            output: [num_tokens, num_heads, head_size]
+            k_cache: [max_total_num_tokens, num_heads, head_size]
+            v_cache: [max_total_num_tokens, num_heads, head_size]
+            req_to_token: [max_num_reqs, max_context_len]
+            req_pool_indices: [num_seqs]
+            seq_lens: [num_seqs]
+            extend_prefix_lens: [num_seqs]
+            extend_seq_lens: [num_seqs]
+            scaling: float or None
+            enable_gqa: bool
+            causal: bool
+
+        Returns:
+            output: [num_tokens, num_heads, head_size]
+        """
+
+        assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
+        assert seq_lens.shape[0] == extend_seq_lens.shape[0]
+
+        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
+        query = query.movedim(0, query.dim() - 2)
+
+        bs = seq_lens.shape[0]
+        max_seq_len = torch.max(seq_len_kv)
+        max_extend_len = torch.max(extend_seq_lens)
+        query_num_heads, query_head_size = query.shape[0], query.shape[-1]
+        kv_num_heads, kv_head_size = k_cache.shape[-2], k_cache.shape[-1]
+
+        padded_query = torch.zeros(
+            [bs, query_num_heads, max_extend_len, query_head_size], device=query.device
+        )
+        padded_key = torch.zeros(
+            [bs, kv_num_heads, max_seq_len, kv_head_size], device=k_cache.device
+        )
+        padded_value = torch.zeros(
+            [bs, kv_num_heads, max_seq_len, kv_head_size], device=k_cache.device
+        )
+
+        start_q, start_kv = 0, 0
+        for seq_idx in range(seq_lens.shape[0]):
+            extend_seq_len_q = extend_seq_lens[seq_idx]
+            seq_len_kv = seq_lens[seq_idx]
+            end_q = start_q + extend_seq_len_q
+            end_kv = start_kv + seq_len_kv
+
+            per_req_query = query[:, start_q:end_q, :]
+            padded_query[seq_idx, :, -extend_seq_len_q:, :] = per_req_query
+
+            # get key and value from cache. per_req_tokens contains the kv cache
+            # index for each token in the sequence.
+            req_pool_idx = req_pool_indices[seq_idx]
+            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+
+            padded_key[seq_idx, :, -seq_len_kv:, :] = per_req_key
+            padded_value[seq_idx, :, -seq_len_kv:, :] = per_req_value
+
+            start_q, start_kv = end_q, end_kv
+
+        if causal:
+            mask = self._create_attn_mask(
+                bs,
+                padded_query.shape[1],
+                max_extend_len,
+                max_extend_len,
+                padded_query.device,
+            )
+        else:
+            mask = None
+
+        padded_out = self.sdpa_kernel(
+            padded_query,
+            padded_key,
+            padded_value,
+            attn_mask=mask,
+            enable_gqa=enable_gqa,
+            scale=scaling,
+        )
+
+        start_q = 0
+        for seq_idx in range(seq_lens.shape[0]):
+            extend_seq_len_q = extend_seq_lens[seq_idx]
+            end_q = start_q + extend_seq_len_q
+            output[start_q:end_q, :, :] = (
+                padded_out[seq_idx, :, -extend_seq_len_q:, :]
+                .squeeze(0)
+                .movedim(query.dim() - 2, 0)
+            )
+            start_q = end_q
+
+        return output
+
     def _run_sdpa_forward_decode(
         self,
         query: torch.Tensor,
@@ -248,7 +361,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        self._run_sdpa_forward_extend(
+        self._run_sdpa_forward_extend_with_padding(
             q_,
             o_,
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
