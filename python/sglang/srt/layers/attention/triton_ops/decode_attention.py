@@ -56,6 +56,10 @@ def _fwd_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
 ):
+    # This kernel perform the qk bmm calculation. Since q seqlen is 1 in
+    # decoding, we can't parallel in q seqlen dimension. So, this kernel does
+    # parallel in kv seqlen dimension. Besides, this kernel also does parallel
+    # in num_head and batch dimension.
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     split_k_id = tl.program_id(2)
@@ -69,7 +73,7 @@ def _fwd_kernel_stage1(
     cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
-    q = tl.load(Q + off_q).to(reduce_dtype)
+    q = tl.load(Q + off_q).to(reduce_dtype) # q in shape [BLOCK_DMODEL]
 
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, SPLIT_K)
     split_k_start = kv_len_per_split * split_k_id
@@ -91,7 +95,7 @@ def _fwd_kernel_stage1(
             K_Buffer + offs_buf_k,
             mask=(offs_n[:, None] < split_k_end) & (offs_d[None, :] < Lk),
             other=0.0,
-        ).to(reduce_dtype)
+        ).to(reduce_dtype) # k in shape [BLOCK_N, BLOCK_DMODEL]
         att_value = tl.sum(q[None, :] * k, 1)
         att_value *= sm_scale
 
@@ -122,6 +126,7 @@ def _fwd_kernel_stage2(
     BLOCK_N: tl.constexpr,
     Lv: tl.constexpr,
 ):
+    # This kernel does parallel in batch and num head dimension.
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
 
@@ -297,6 +302,8 @@ def _fwd_grouped_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
 ):
+    # what is the difference between this kernel and thhe _fwd_kernel_stage1?
+    # 
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
@@ -320,7 +327,7 @@ def _fwd_grouped_kernel_stage1(
     offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
     q = tl.load(
         Q + offs_q, mask=(mask_h[:, None]) & (offs_d[None, :] < Lk), other=0.0
-    ).to(reduce_dtype)
+    ).to(reduce_dtype) # q in shape [BLOCK_H, BLOCK_DMODEL]
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
@@ -349,8 +356,9 @@ def _fwd_grouped_kernel_stage1(
             K_Buffer + offs_buf_k,
             mask=(offs_n[None, :] < split_k_end) & (offs_d[:, None] < Lk),
             other=0.0,
-        ).to(reduce_dtype)
-        qk = tl.dot(q, k)
+        ).to(reduce_dtype) # k in shape [BLOCK_DMODEL, BLOCK_N]
+        qk = tl.dot(q, k) # qk in shape [BLOCK_H, BLOCK_N]
+        # so that we can calculate BLOCK_H q heads with one key read
         if BLOCK_DPE > 0:
             offs_buf_kpe = (
                 k_loc[None, :] * stride_buf_kbs
@@ -494,6 +502,8 @@ def _decode_grouped_att_m_fwd(
 
     BLOCK_H = max(16, min(64, triton.next_power_of_2(kv_group_num)))
     SPLIT_K = 8
+    # each program instance process BLOCK_H q heads, to reduce the kv read
+    # duplication ?
     grid = (
         batch,
         triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),

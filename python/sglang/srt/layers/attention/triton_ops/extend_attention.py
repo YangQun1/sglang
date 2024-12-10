@@ -80,12 +80,13 @@ def _fwd_kernel(
     cur_block_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
 
-    cur_seq_len = tl.load(B_Seq_Len + cur_seq)
-    cur_seq_len_extend = tl.load(B_Seq_Len_Extend + cur_seq)
-    cur_seq_len_prefix = cur_seq_len - cur_seq_len_extend
+    # Note: cur_seq_len_extend + cur_seq_len_prefix == cur_seq_len
+    cur_seq_len = tl.load(B_Seq_Len + cur_seq) # total length if current sequence
+    cur_seq_len_extend = tl.load(B_Seq_Len_Extend + cur_seq) # the extend length of current sequence
+    cur_seq_len_prefix = cur_seq_len - cur_seq_len_extend # the prefix length of current sequence
 
     cur_seq_prefix_start_in_loc = 0
-    cur_seq_extend_start_contiguous = tl.load(B_Start_Loc_Extend + cur_seq)
+    cur_seq_extend_start_contiguous = tl.load(B_Start_Loc_Extend + cur_seq) # the start location of current sequence in extend query buffer
     cur_batch_req_idx = tl.load(B_req_idx + cur_seq)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
@@ -181,6 +182,9 @@ def _fwd_kernel(
 
     # stage 2: compute the trianlge part
 
+    # Note: For the triangle part, we only need to compute the attn for kv that
+    # are before the current query. Will this cause imbalance computation?
+    # program instrance with larger cur_block_m must run more iterations
     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     for start_n in range(0, cur_block_m_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
