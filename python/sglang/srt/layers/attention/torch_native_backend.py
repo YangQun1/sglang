@@ -361,7 +361,9 @@ class TorchNativeAttnBackend(AttentionBackend):
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        self._run_sdpa_forward_extend_with_padding(
+        # We can't use the padding version forward_extend, because padded
+        # sequences may exceed the max token numbers and cause OOM.
+        self._run_sdpa_forward_extend(
             q_,
             o_,
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
