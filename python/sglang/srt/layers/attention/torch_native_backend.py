@@ -197,7 +197,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         query = query.movedim(0, query.dim() - 2)
 
         bs = seq_lens.shape[0]
-        max_seq_len = torch.max(seq_len_kv)
+        max_seq_len = torch.max(seq_lens)
         max_extend_len = torch.max(extend_seq_lens)
         query_num_heads, query_head_size = query.shape[0], query.shape[-1]
         kv_num_heads, kv_head_size = k_cache.shape[-2], k_cache.shape[-1]
