@@ -86,7 +86,7 @@ def _fwd_kernel_stage1(
     cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
-    q = tl.load(Q + off_q, mask=mask_d, other=0.0)
+    q = tl.load(Q + off_q, mask=mask_d, other=0.0) # q in shape [BLOCK_DMODEL]
 
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
@@ -113,8 +113,8 @@ def _fwd_kernel_stage1(
                 K_Buffer + offs_buf_k,
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
                 other=0.0,
-            )
-            qk = tl.sum(q[None, :] * k, 1)
+            ) # k in shape [BLOCK_N, BLOCK_DMODEL]
+            qk = tl.sum(q[None, :] * k, 1) # qk in shape [BLOCK_N]
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -131,13 +131,13 @@ def _fwd_kernel_stage1(
                 V_Buffer + offs_buf_v,
                 mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
                 other=0.0,
-            )
+            ) # v in shape [BLOCK_N, BLOCK_DV]
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
             re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max)
+            p = tl.exp(qk - n_e_max) # p in shape [BLOCK_N]
             acc *= re_scale
-            acc += tl.sum(p[:, None] * v, 0)
+            acc += tl.sum(p[:, None] * v, 0) # acc in shape [BLOCK_DV], acc is partially reduced in kv seq len dimension
 
             e_sum = e_sum * re_scale + tl.sum(p, 0)
             e_max = n_e_max
@@ -149,7 +149,7 @@ def _fwd_kernel_stage1(
             + offs_dv
         )
 
-        tl.store(
+        tl.store( # finally each acc is partially reduced in kv seq len dimension, the reduced range is from split_kv_start to split_kv_end
             Att_Out + offs_mid_o,
             acc / e_sum,
             mask=(mask_dv),
@@ -283,7 +283,7 @@ def _fwd_grouped_kernel_stage1(
     cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
 
     offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
-    q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
+    q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0) # q in shape [BLOCK_H, BLOCK_DMODEL]
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
@@ -495,11 +495,11 @@ def _fwd_kernel_stage2(
 
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
-
+    # in each iter, we load one partially reduced data, and then do further reduce.
     for split_kv_id in range(0, NUM_KV_SPLITS):
         tv = tl.load(
             Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
-        )
+        ) # tv in shape [BLOCK_DV]
         tlogic = tl.load(Mid_O + offs_logic + split_kv_id * stride_mid_os)
         n_e_max = tl.maximum(tlogic, e_max)
 
