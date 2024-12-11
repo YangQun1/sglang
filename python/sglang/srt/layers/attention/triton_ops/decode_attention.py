@@ -96,12 +96,14 @@ def _fwd_kernel_stage1(
             mask=(offs_n[:, None] < split_k_end) & (offs_d[None, :] < Lk),
             other=0.0,
         ).to(reduce_dtype) # k in shape [BLOCK_N, BLOCK_DMODEL]
-        att_value = tl.sum(q[None, :] * k, 1)
+        att_value = tl.sum(q[None, :] * k, 1) # att_value in shape [BLOCK_N]
         att_value *= sm_scale
 
         if logit_cap > 0:
             att_value = logit_cap * tanh(att_value / logit_cap)
 
+        # Att_Out is in shape [head_num, total_token_num], while the
+        # total_token_num is the sum of k seq len in batch.
         off_o = cur_head * att_stride_h + (cur_batch_in_all_start_index + offs_n)
         tl.store(Att_Out + off_o, att_value, mask=offs_n < split_k_end)
 
