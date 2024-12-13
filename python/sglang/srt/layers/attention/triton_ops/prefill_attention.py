@@ -29,12 +29,12 @@ if is_cuda_available:
 
 @triton.jit
 def _fwd_kernel(
-    Q,
-    K,
-    V,
+    Q, # [num_tokens, num_heads, head_size]
+    K, # [num_tokens, num_kv_heads, head_size]
+    V, # [num_tokens, num_kv_heads, head_size]
     sm_scale,
-    B_Start_Loc,
-    B_Seqlen,
+    B_Start_Loc, # [batch_size], the start token index of each sequence
+    B_Seqlen, # [batch_size], the length of each sequence
     Out,
     stride_qbs,
     stride_qh,
@@ -51,6 +51,15 @@ def _fwd_kernel(
     IS_CAUSAL: tl.constexpr,
     Lk: tl.constexpr,
 ):
+    """
+    Each kernel instance computes the attention per query block per head per sequence.
+    So actually, each instance perform attntion on such tensors:
+    Q: [BLOCK_M, BLOCK_DMODEL]
+    K: [SEQ_LEN, BLOCK_DMODEL]
+    V: [SEQ_LEN, BLOCK_DMODEL]
+    and output such results:
+    O: [BLOCK_M, BLOCK_DMODEL]
+    """
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     start_m = tl.program_id(2)
@@ -80,7 +89,7 @@ def _fwd_kernel(
         Q + off_q,
         mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :]),
         other=0.0,
-    )
+    ) # q in shape [BLOCK_M, BLOCK_DMODEL]
 
     k_ptrs = K + off_k
     v_ptrs = V + off_v
@@ -92,6 +101,9 @@ def _fwd_kernel(
 
     block_mask = tl.where(block_start_loc < cur_batch_seq_len, 1, 0)
 
+    # Note: if IS_CAUSAL, we only need to compute the attn for kv that are
+    # before the current query. Will this cause imbalance computation? program
+    # instrance with larger cur_block_m must run more iterations
     end_n = (
         cur_batch_seq_len
         if not IS_CAUSAL
@@ -104,7 +116,7 @@ def _fwd_kernel(
             k_ptrs + (cur_batch_in_all_start_index + start_n) * stride_kbs,
             mask=((start_n + offs_n[None, :]) < cur_batch_seq_len) & (mask_d[:, None]),
             other=0.0,
-        )
+        ) # k in shape [BLOCK_N, BLOCK_DMODEL]
         # mask = tl.load(mask_ptrs + start_n, mask=start_n + offs_n < cur_batch_end_loc, other=0.0)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
