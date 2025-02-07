@@ -197,10 +197,11 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region():
+            buffer_creator = torch.zeros if self.device == "hpu" else torch.empty
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.k_buffer = [
-                torch.empty(
+                buffer_creator(
                     (self.size + 1, self.head_num, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
@@ -208,7 +209,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 for _ in range(self.layer_num)
             ]
             self.v_buffer = [
-                torch.empty(
+                buffer_creator(
                     (self.size + 1, self.head_num, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
@@ -317,9 +318,10 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         )
 
         with memory_saver_adapter.region():
+            buffer_creator = torch.zeros if device == "hpu" else torch.empty
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.kv_buffer = [
-                torch.empty(
+                buffer_creator(
                     (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
                     dtype=self.store_dtype,
                     device=device,
