@@ -8,6 +8,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul,
 )
 from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_compiler_backend
 
 is_hip_ = is_hip()
 
@@ -111,6 +112,98 @@ def block_quant_to_tensor_quant(
 
     x_q_tensor, scale = input_to_float8(x_dq_block, dtype=x_q_block.dtype)
     return x_q_tensor, scale
+
+
+def pad_weight(weight, block_size):
+    """Pads a matrix to make its dimensions multiples of block_size."""
+    M, N = weight.shape[-2:]
+    block_size_m, block_size_n = block_size
+    pad_M = (block_size_m - M % block_size_m) % block_size_m
+    pad_N = (block_size_n - N % block_size_n) % block_size_n
+
+    if pad_M == 0 and pad_N == 0:
+        return weight, M, N  # No padding needed
+    padded_weight = torch.nn.functional.pad(weight, (0, pad_N, 0, pad_M), mode='constant', value=0)
+    padded_weight = torch.nn.Parameter(padded_weight, requires_grad=False)
+    return padded_weight, M, N  # Return original dimensions for unpadding
+
+def unpad_weight(weight, original_M, original_N, keep_first_dim=False):
+    """Removes padding from the matrix to restore its original shape."""
+    if keep_first_dim:
+        return weight[:, :original_M, :original_N]
+    else:
+        return weight[:original_M, :original_N]
+
+@torch.compile(dynamic=False, backend=get_compiler_backend())
+def pad_block_fp8_weight_naive(weight, weight_scale, block_size):
+
+    assert len(block_size) == 2
+
+    block_size_m, block_size_n = block_size
+    weight_scale_m, weight_scale_n = weight_scale.shape[-2:]
+
+    weight, orig_M, orig_N = pad_weight(weight, block_size)
+    M, N = weight.shape[-2:]
+
+    assert weight_scale_m == M // block_size_m
+    assert weight_scale_n == N // block_size_n
+
+    return weight, orig_M, orig_N
+
+
+@torch.compile(dynamic=False, backend=get_compiler_backend())
+def dequant_block_fp8_weight_naive(weight, weight_scale, block_size, dtype, original_M, original_N):
+
+    assert len(block_size) == 2
+    
+    weight_shape_len = len(weight.shape)
+
+    block_size_m, block_size_n = block_size
+
+    # mul scale
+    if weight_shape_len == 2:
+        weight_scale_m, weight_scale_n = weight_scale.shape
+        weight_scale = weight_scale.view(weight_scale_m, 1, weight_scale_n, 1)
+        weight = weight.view(weight_scale_m, block_size_m, weight_scale_n, block_size_n)
+        dequant_weight = weight.to(dtype) * weight_scale.to(dtype)
+        dequant_weight = dequant_weight.view(weight_scale_m*block_size_m, weight_scale_n*block_size_n)
+        keep_first_dim = False
+    elif weight_shape_len == 3:
+        fd, weight_scale_m, weight_scale_n = weight_scale.shape
+        weight_scale = weight_scale.view(fd, weight_scale_m, 1, weight_scale_n, 1)
+        weight = weight.view(fd, weight_scale_m, block_size_m, weight_scale_n, block_size_n)
+        dequant_weight = weight.to(dtype) * weight_scale.to(dtype)
+        dequant_weight = dequant_weight.view(fd, weight_scale_m*block_size_m, weight_scale_n*block_size_n)
+        keep_first_dim = True
+    else:
+        raise ValueError("Only support original weight shape is either 2 or 3")
+
+    dequant_weight = unpad_weight(dequant_weight, original_M, original_N, keep_first_dim=keep_first_dim)
+
+    return dequant_weight
+
+
+def apply_block_fp8_linear_hpu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    original_M: Optional[torch.Tensor] = None,
+    original_N: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    assert input_scale is None
+    # View input as 2D matrix for fp8 methods
+    input_2d = input.view(-1, input.shape[-1])
+    original_M = original_M.data
+    original_N = original_N.data
+    output_shape = [*input.shape[:-1], original_M]
+    dequant_weight = dequant_block_fp8_weight_naive(weight, weight_scale, block_size, input_2d.dtype, original_M, original_N)
+    output = torch.nn.functional.linear(input_2d, dequant_weight, bias=None)
+    if bias is not None:
+        output = output + bias
+    return output.to(dtype=input.dtype).view(*output_shape)
 
 
 class BlockQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter):

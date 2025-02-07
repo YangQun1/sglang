@@ -287,7 +287,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
             if is_hpu_:
-                from vllm.model_executor.layers.quantization.utils.fp8_utils import pad_block_fp8_weight_naive
+                from sglang.srt.layers.quantization.fp8_utils import pad_block_fp8_weight_naive
                 layer.weight, orig_M, orig_N = pad_block_fp8_weight_naive(
                     layer.weight,
                     layer.weight_scale_inv,
@@ -407,7 +407,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        from vllm.model_executor.layers.quantization.utils.fp8_utils import apply_block_fp8_linear_hpu
+        from sglang.srt.layers.quantization.fp8_utils import apply_block_fp8_linear_hpu
         if self.block_quant:
             if is_hpu_:
                 return apply_block_fp8_linear_hpu(
@@ -613,7 +613,7 @@ class Fp8MoEMethod:
         if self.block_quant:
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if is_hpu_:
-                from vllm.model_executor.layers.quantization.utils.fp8_utils import pad_block_fp8_weight_naive
+                from sglang.srt.layers.quantization.fp8_utils import pad_block_fp8_weight_naive
                 layer.w13_weight, orig_M_w13, orig_N_w13 = pad_block_fp8_weight_naive(
                     layer.w13_weight,
                     layer.w13_weight_scale_inv,
@@ -947,7 +947,7 @@ class Fp8MoEMethod:
 
         # w13_list = layer.hpu_fused_moe.MoeOp.w13_list
         # w2_list = layer.hpu_fused_moe.MoeOp.w2_list
-        from vllm.model_executor.layers.quantization.utils.fp8_utils import dequant_block_fp8_weight_naive
+        from sglang.srt.layers.quantization.fp8_utils import dequant_block_fp8_weight_naive
 
         orig_M_w13 = layer.orig_M_w13.data
         orig_N_w13 = layer.orig_N_w13.data
@@ -969,15 +969,17 @@ class Fp8MoEMethod:
             min_expert = i * n_expert_slice
             max_expert = (i + 1) * n_expert_slice
 
+            # here, the w13 should be the fused gate+up proj weights, w2 should be the down proj weight
             w13_list_slice = [w13_weight[j] for j in range(min_expert, max_expert)]
             w2_list_slice = [w2_weight[j] for j in range(min_expert, max_expert)]
 
+            # each expert: out = down_proj(act_fn(gate_proj(x)) * up_proj(x))
             final_hidden_states += torch.ops.hpu.mixture_of_experts(
                                          hidden_states=x,
                                          expert_routing_table=topk_ids.to(torch.int64),
                                          router_weights=topk_weights.to(x.dtype),
-                                         w12=w13_list_slice,
-                                         w3=w2_list_slice,
+                                         w12=w13_list_slice, # w12 is gate+up proj weights
+                                         w3=w2_list_slice, # w3 is down proj weight
                                          permuted_weights=True,
                                          activation="silu",
                                          experts_min=min_expert,
