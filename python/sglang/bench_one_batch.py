@@ -343,6 +343,7 @@ def latency_test_run_once(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
+                torch.profiler.ProfilerActivity.HPU,
             ],
             with_stack=True,
         )
