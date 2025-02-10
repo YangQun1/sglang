@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     permute_weight,
     print_warning_once,
     set_weight_attrs,
+    get_compiler_backend,
 )
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -968,24 +969,43 @@ class Fp8MoEMethod:
         for i in range(self.moe_n_slice):
             min_expert = i * n_expert_slice
             max_expert = (i + 1) * n_expert_slice
+            final_hidden_states += per_experts_slice_computation(x, w13_weight, w2_weight, topk_ids, topk_weights, min_expert, max_expert)
 
-            # here, the w13 should be the fused gate+up proj weights, w2 should be the down proj weight
-            w13_list_slice = [w13_weight[j] for j in range(min_expert, max_expert)]
-            w2_list_slice = [w2_weight[j] for j in range(min_expert, max_expert)]
+            # # here, the w13 should be the fused gate+up proj weights, w2 should be the down proj weight
+            # w13_list_slice = [w13_weight[j] for j in range(min_expert, max_expert)]
+            # w2_list_slice = [w2_weight[j] for j in range(min_expert, max_expert)]
 
-            # each expert: out = down_proj(act_fn(gate_proj(x)) * up_proj(x))
-            final_hidden_states += torch.ops.hpu.mixture_of_experts(
-                                         hidden_states=x,
-                                         expert_routing_table=topk_ids.to(torch.int64),
-                                         router_weights=topk_weights.to(x.dtype),
-                                         w12=w13_list_slice, # w12 is gate+up proj weights
-                                         w3=w2_list_slice, # w3 is down proj weight
-                                         permuted_weights=True,
-                                         activation="silu",
-                                         experts_min=min_expert,
-                                         experts_max=max_expert - 1)
+            # # each expert: out = down_proj(act_fn(gate_proj(x)) * up_proj(x))
+            # final_hidden_states += self.compiled_moe_fn(
+            #                              hidden_states=x,
+            #                              expert_routing_table=topk_ids.to(torch.int64),
+            #                              router_weights=topk_weights.to(x.dtype),
+            #                              w12=w13_list_slice, # w12 is gate+up proj weights
+            #                              w3=w2_list_slice, # w3 is down proj weight
+            #                              permuted_weights=True,
+            #                              activation="silu",
+            #                              experts_min=min_expert,
+            #                              experts_max=max_expert - 1)
         return final_hidden_states.view(-1, x.shape[1])
 
+@torch.compile(dynamic=False, backend=get_compiler_backend())
+def per_experts_slice_computation(x, w13_weight, w2_weight, topk_ids, topk_weights, min_expert, max_expert):
+
+    # here, the w13 should be the fused gate+up proj weights, w2 should be the down proj weight
+    w13_list_slice = [w13_weight[j] for j in range(min_expert, max_expert)]
+    w2_list_slice = [w2_weight[j] for j in range(min_expert, max_expert)]
+
+    # each expert: out = down_proj(act_fn(gate_proj(x)) * up_proj(x))
+    return torch.ops.hpu.mixture_of_experts(
+                hidden_states=x,
+                expert_routing_table=topk_ids.to(torch.int64),
+                router_weights=topk_weights.to(x.dtype),
+                w12=w13_list_slice, # w12 is gate+up proj weights
+                w3=w2_list_slice, # w3 is down proj weight
+                permuted_weights=True,
+                activation="silu",
+                experts_min=min_expert,
+                experts_max=max_expert - 1)
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
     """

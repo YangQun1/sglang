@@ -57,6 +57,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda_available, is_hip
+from sglang.srt.utils import get_compiler_backend
 
 is_hip_ = is_hip()
 
@@ -64,6 +65,7 @@ if is_cuda_available():
     from sgl_kernel import bmm_fp8
 
 
+@torch.compile(dynamic=False, backend=get_compiler_backend())
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,

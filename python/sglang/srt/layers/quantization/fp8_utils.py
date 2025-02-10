@@ -151,7 +151,7 @@ def pad_block_fp8_weight_naive(weight, weight_scale, block_size):
     return weight, orig_M, orig_N
 
 
-@torch.compile(dynamic=False, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def dequant_block_fp8_weight_naive(weight, weight_scale, block_size, dtype, original_M, original_N):
 
     assert len(block_size) == 2
