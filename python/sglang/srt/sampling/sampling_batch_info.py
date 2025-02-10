@@ -367,7 +367,7 @@ class SamplingBatchInfo:
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
-            setattr(self, item, torch.concat([self_val, other_val]))
+            setattr(self, item, torch.concat([self_val.cpu(), other_val.cpu()]).to("hpu"))
 
         self.is_all_greedy = self.is_all_greedy and other.is_all_greedy
         self.need_min_p_sampling = self.need_min_p_sampling or other.need_min_p_sampling
