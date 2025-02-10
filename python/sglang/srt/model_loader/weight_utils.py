@@ -594,16 +594,18 @@ def initialize_dummy_weights(
     """
     for param in model.state_dict().values():
         if torch.is_floating_point(param):
-            generator = torch.Generator(device=param.data.device)
+            generator = torch.Generator(device="cpu") # HPU 1.19 not support generator
             generator.manual_seed(seed)
             if torch.finfo(param.data.dtype).bits < 16:
                 # uniform_ doesn't support < 16-bit datatypes (FP8)
                 dtype = param.data.dtype
                 tmp_param = param.data.to(torch.float16)
                 tmp_param = tmp_param.uniform_(low, high, generator=generator).to(dtype)
-                param.data.copy_(tmp_param)
+                param.data.copy_(tmp_param.to(param.data.device))
             else:
-                param.uniform_(low, high, generator=generator)
+                tmp_param = param.data.to("cpu")
+                tmp_param = tmp_param.uniform_(low, high, generator=generator)
+                param.data.copy_(tmp_param.to(param.data.device))
 
 
 def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
