@@ -67,18 +67,21 @@ def moe_forward_native(
     activation: str = "silu",
 ) -> torch.Tensor:
 
+    # TODO: fix accuracy issue on HPU
     topk_weights, topk_ids = select_experts(
-        hidden_states=x,
-        router_logits=router_logits,
+        hidden_states=x.cpu(),
+        router_logits=router_logits.cpu(),
         use_grouped_topk=use_grouped_topk,
         top_k=top_k,
         renormalize=renormalize,
         topk_group=topk_group,
         num_expert_group=num_expert_group,
         custom_routing_function=custom_routing_function,
-        correction_bias=correction_bias,
+        correction_bias=correction_bias.cpu() if correction_bias is not None else None,
         torch_native=True,
     )
+    orig_device = router_logits.device
+    topk_weights, topk_ids = topk_weights.to(orig_device), topk_ids.to(orig_device)
 
     # Ref code from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/e0828e3cc0a03408724b80c3cc92c8e072db8d01/modeling_deepseek.py#L589
     len_experts = layer.num_experts
