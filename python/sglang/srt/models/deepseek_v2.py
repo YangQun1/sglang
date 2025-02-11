@@ -65,7 +65,7 @@ if is_cuda_available():
     from sgl_kernel import bmm_fp8
 
 
-@torch.compile(dynamic=False, backend=get_compiler_backend())
+# @torch.compile(dynamic=False, backend=get_compiler_backend())
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
