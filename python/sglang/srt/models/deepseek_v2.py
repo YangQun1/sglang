@@ -64,6 +64,10 @@ is_hip_ = is_hip()
 if is_cuda_available():
     from sgl_kernel import bmm_fp8
 
+import os
+tensor_data_dir = os.environ.get("SGLANG_TENSOR_DATA_DIR", None)
+first_n_layers = int(os.environ.get("SGLANG_SAVE_FIRST_N_LAYERS", 4))
+num_decoder_layers = int(os.environ.get("SGLANG_NUM_DECODER_LAYERS", 4))
 
 # @torch.compile(dynamic=False, backend=get_compiler_backend())
 class DeepseekV2MLP(nn.Module):
@@ -124,8 +128,10 @@ class DeepseekV2MoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_id=None
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
@@ -173,12 +179,24 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
+            if tensor_data_dir is not None and self.layer_id < first_n_layers:
+                name = f"/decoder_{self.layer_id}_shared_experts_output_data.pt"
+                torch.save(shared_output, tensor_data_dir+name)
+
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
+        if tensor_data_dir is not None and self.layer_id < first_n_layers:
+            name = f"/decoder_{self.layer_id}_moe_gate_output_data.pt"
+            torch.save(router_logits, tensor_data_dir+name)
+
         final_hidden_states = (
             self.experts(hidden_states=hidden_states, router_logits=router_logits)
             * self.routed_scaling_factor
         )
+        if tensor_data_dir is not None and self.layer_id < first_n_layers:
+            name = f"/decoder_{self.layer_id}_experts_output_data.pt"
+            torch.save(final_hidden_states, tensor_data_dir+name)
+
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
@@ -729,7 +747,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
         ):
-            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config)
+            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config, layer_id=layer_id)
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -741,6 +759,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.layer_id = layer_id
 
     def forward(
         self,
@@ -757,14 +776,27 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+            if tensor_data_dir is not None and self.layer_id < first_n_layers:
+                name = f"/decoder_{self.layer_id}_input_layernorm_output_data.pt"
+                torch.save(hidden_states, tensor_data_dir+name)
+
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+
+            if tensor_data_dir is not None and self.layer_id < first_n_layers:
+                name = f"/decoder_{self.layer_id}_self_attn_output_data.pt"
+                torch.save(hidden_states, tensor_data_dir+name)
+
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
+
+            if tensor_data_dir is not None and self.layer_id < first_n_layers:
+                name = f"/decoder_{self.layer_id}_post_attention_layernorm_output_data.pt"
+                torch.save(hidden_states, tensor_data_dir+name)
 
         # Fully Connected
         if self.enable_dp_attention:
@@ -775,6 +807,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = hidden_states[start_idx:end_idx]
         else:
             hidden_states = self.mlp(hidden_states)
+
+        if tensor_data_dir is not None and self.layer_id < first_n_layers:
+            name = f"/decoder_{self.layer_id}_mlp_output_data.pt"
+            torch.save(hidden_states, tensor_data_dir+name)
 
         return hidden_states, residual
 
@@ -804,7 +840,7 @@ class DeepseekV2Model(nn.Module):
                     layer_id,
                     quant_config=quant_config,
                 )
-                for layer_id in range(config.num_hidden_layers)
+                for layer_id in range(num_decoder_layers) # range(config.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -815,13 +851,28 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if forward_batch.forward_mode.is_decode():
+            print("decode run")
+            return self.embed_tokens(input_ids)
+        else:
+            print("prefill run")
+        print("Model forward ... with", input_ids)
         hidden_states = self.embed_tokens(input_ids)
+        if tensor_data_dir is not None:
+            name = f"/input_ids_data.pt"
+            torch.save(input_ids, tensor_data_dir+name)
+            name = f"/input_embed_output_data.pt"
+            torch.save(hidden_states, tensor_data_dir+name)
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+            if tensor_data_dir is not None and i < first_n_layers:
+                name = f"/decoder_{i}_output_data.pt"
+                torch.save(hidden_states, tensor_data_dir+name)
+                
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
