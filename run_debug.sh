@@ -69,34 +69,44 @@ export PT_HPU_ENABLE_WAITTENSOR_GRAPH_SPLIT=0
 #     --load-format dummy \
 #     --disable-mla
 
-export SGLANG_NUM_DECODER_LAYERS=3
-export SGLANG_SAVE_FIRST_N_LAYERS=3
-export SGLANG_TENSOR_DATA_DIR=/software/users/quyang/tensor_data/hpu/
+export SGLANG_NUM_DECODER_LAYERS=61
+export SGLANG_SAVE_FIRST_N_LAYERS=61
+# export SGLANG_TENSOR_DATA_DIR=tensor_data/hpu/
+# export SGLANG_TORCH_PROFILER_DIR=~/upstream/sglang/profile/
 python examples/runtime/engine/offline_batch_inference.py \
     --device hpu \
+    --tp 8 \
     --model-path /software/data/DeepSeek-R1 \
     --trust-remote-code \
     --attention-backend torch_native \
-    --load-format dummy \
-    --disable-mla
+    --disable-mla \
+    --watchdog-timeout 3000 > disable_mla.log 2>&1
+
+python examples/runtime/engine/offline_batch_inference.py \
+    --device hpu \
+    --tp 8 \
+    --model-path /software/data/DeepSeek-R1 \
+    --trust-remote-code \
+    --attention-backend torch_native \
+    --watchdog-timeout 3000 > enable_mla.log 2>&1
 
 # export PT_HPU_ENABLE_RECORD_STREAM=1
 # export PT_HPU_ENABLE_RECORD_STREAM_NOHOLDER=1
 # export PT_HPU_USE_LAUNCH_RECORD_STREAM=1
 # export HABANA_PROFILE=1
-# export SGLANG_TORCH_PROFILER_DIR=~/upstream/sglang
+# export SGLANG_TORCH_PROFILER_DIR=~/upstream/sglang/profile/
 # python3 -m sglang.bench_one_batch \
-#     --batch-size 1 \
+#     --batch-size 2 \
 #     --input 256 \
-#     --output 4 \
-#     --model deepseek-ai/DeepSeek-R1 \
+#     --output 8 \
+#     --model /software/data/DeepSeek-R1 \
 #     --trust-remote-code \
 #     --device hpu \
 #     --tp 8 \
-#     --load-format dummy \
-#     --disable-mla
-    # --profile \
-    # --profile-filename-prefix profile_$(date +%Y%m%d_%H%M%S)
+#     --disable-mla \
+#     --watchdog-timeout 3000 \
+#     --profile \
+#     --profile-filename-prefix profile_$(date +%Y%m%d_%H%M%S)
     # > dynamo.log 2>&1
 
 # deepseek v3

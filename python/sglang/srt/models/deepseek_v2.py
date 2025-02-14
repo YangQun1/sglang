@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 from vllm import _custom_ops as ops
+import time
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -56,20 +57,35 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import is_cuda_available, is_hip
+from sglang.srt.utils import is_cuda_available, is_hip, is_hpu
 from sglang.srt.utils import get_compiler_backend
 
 is_hip_ = is_hip()
+is_hpu_ = is_hpu()
 
 if is_cuda_available():
     from sgl_kernel import bmm_fp8
+elif is_hpu_:
+    def hpu_bmm_fp8(
+            A: torch.Tensor,
+            B: torch.Tensor,
+            A_scale: torch.Tensor,
+            B_scale: torch.Tensor,
+            dtype: torch.dtype,
+            out: Optional[torch.Tensor] = None):
+        return torch.ops.hpu.fp8_gemm_v2(A, False, B, False, out, dtype, A_scale, B_scale)
+    bmm_fp8 = hpu_bmm_fp8
+else:
+    pass
 
 import os
-tensor_data_dir = os.environ.get("SGLANG_TENSOR_DATA_DIR", None)
+g_tensor_data_dir = os.environ.get("SGLANG_TENSOR_DATA_DIR", None)
 first_n_layers = int(os.environ.get("SGLANG_SAVE_FIRST_N_LAYERS", 4))
 num_decoder_layers = int(os.environ.get("SGLANG_NUM_DECODER_LAYERS", 4))
+is_rank0 = get_tensor_model_parallel_rank() == 0
+curr_tensor_data_dir = None
 
-# @torch.compile(dynamic=False, backend=get_compiler_backend())
+@torch.compile(dynamic=False, backend=get_compiler_backend())
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -175,27 +191,28 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        global curr_tensor_data_dir
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
-            if tensor_data_dir is not None and self.layer_id < first_n_layers:
+            if is_rank0 and curr_tensor_data_dir is not None and self.layer_id < first_n_layers:
                 name = f"/decoder_{self.layer_id}_shared_experts_output_data.pt"
-                torch.save(shared_output, tensor_data_dir+name)
+                torch.save(shared_output, curr_tensor_data_dir+name)
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        if tensor_data_dir is not None and self.layer_id < first_n_layers:
+        if is_rank0 and curr_tensor_data_dir is not None and self.layer_id < first_n_layers:
             name = f"/decoder_{self.layer_id}_moe_gate_output_data.pt"
-            torch.save(router_logits, tensor_data_dir+name)
+            torch.save(router_logits, curr_tensor_data_dir+name)
 
         final_hidden_states = (
             self.experts(hidden_states=hidden_states, router_logits=router_logits)
             * self.routed_scaling_factor
         )
-        if tensor_data_dir is not None and self.layer_id < first_n_layers:
+        if is_rank0 and curr_tensor_data_dir is not None and self.layer_id < first_n_layers:
             name = f"/decoder_{self.layer_id}_experts_output_data.pt"
-            torch.save(final_hidden_states, tensor_data_dir+name)
+            torch.save(final_hidden_states, curr_tensor_data_dir+name)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -768,6 +785,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        global curr_tensor_data_dir
         # Self Attention
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
@@ -776,9 +794,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-            if tensor_data_dir is not None and self.layer_id < first_n_layers:
+            if is_rank0 and curr_tensor_data_dir is not None and self.layer_id < first_n_layers:
                 name = f"/decoder_{self.layer_id}_input_layernorm_output_data.pt"
-                torch.save(hidden_states, tensor_data_dir+name)
+                torch.save(hidden_states, curr_tensor_data_dir+name)
 
             hidden_states = self.self_attn(
                 positions=positions,
@@ -786,17 +804,17 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-            if tensor_data_dir is not None and self.layer_id < first_n_layers:
+            if is_rank0 and curr_tensor_data_dir is not None and self.layer_id < first_n_layers:
                 name = f"/decoder_{self.layer_id}_self_attn_output_data.pt"
-                torch.save(hidden_states, tensor_data_dir+name)
+                torch.save(hidden_states, curr_tensor_data_dir+name)
 
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
 
-            if tensor_data_dir is not None and self.layer_id < first_n_layers:
+            if is_rank0 and curr_tensor_data_dir is not None and self.layer_id < first_n_layers:
                 name = f"/decoder_{self.layer_id}_post_attention_layernorm_output_data.pt"
-                torch.save(hidden_states, tensor_data_dir+name)
+                torch.save(hidden_states, curr_tensor_data_dir+name)
 
         # Fully Connected
         if self.enable_dp_attention:
@@ -808,9 +826,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp(hidden_states)
 
-        if tensor_data_dir is not None and self.layer_id < first_n_layers:
+        if is_rank0 and curr_tensor_data_dir is not None and self.layer_id < first_n_layers:
             name = f"/decoder_{self.layer_id}_mlp_output_data.pt"
-            torch.save(hidden_states, tensor_data_dir+name)
+            torch.save(hidden_states, curr_tensor_data_dir+name)
 
         return hidden_states, residual
 
@@ -851,27 +869,34 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if forward_batch.forward_mode.is_decode():
-            print("decode run")
-            return self.embed_tokens(input_ids)
-        else:
-            print("prefill run")
-        print("Model forward ... with", input_ids)
+        global curr_tensor_data_dir
+        if is_rank0:
+            curr_time = time.time()
+            if forward_batch.forward_mode.is_decode():
+                print(curr_time, "Model decode ... with", input_ids)
+                if g_tensor_data_dir is not None:
+                    curr_tensor_data_dir = g_tensor_data_dir+"/decode"
+            else:
+                print(curr_time, "Model prefill ... with", input_ids)
+                if g_tensor_data_dir is not None:
+                    curr_tensor_data_dir = g_tensor_data_dir+"/prefill"
+            if g_tensor_data_dir is not None and not os.path.exists(curr_tensor_data_dir):
+                os.makedirs(curr_tensor_data_dir)
         hidden_states = self.embed_tokens(input_ids)
-        if tensor_data_dir is not None:
+        if is_rank0 and curr_tensor_data_dir is not None:
             name = f"/input_ids_data.pt"
-            torch.save(input_ids, tensor_data_dir+name)
+            torch.save(input_ids, curr_tensor_data_dir+name)
             name = f"/input_embed_output_data.pt"
-            torch.save(hidden_states, tensor_data_dir+name)
+            torch.save(hidden_states, curr_tensor_data_dir+name)
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
-            if tensor_data_dir is not None and i < first_n_layers:
+            if  is_rank0 and curr_tensor_data_dir is not None and i < first_n_layers:
                 name = f"/decoder_{i}_output_data.pt"
-                torch.save(hidden_states, tensor_data_dir+name)
+                torch.save(hidden_states, curr_tensor_data_dir+name)
                 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)

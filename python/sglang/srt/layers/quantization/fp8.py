@@ -932,15 +932,19 @@ class Fp8MoEMethod:
         # import habana_frameworks.torch as htorch
         # htorch.core.mark_step()
         topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
+            hidden_states=x.cpu(),
+            router_logits=router_logits.cpu(),
             use_grouped_topk=use_grouped_topk,
             top_k=top_k,
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias)
+            correction_bias=correction_bias.cpu() if correction_bias is not None else None)
+
+        orig_device = x.device
+        topk_weights, topk_ids = topk_weights.to(orig_device), topk_ids.to(orig_device)
+
         final_hidden_states = torch.zeros_like(x)
         num_experts = layer.w13_weight.shape[0]
         n_expert_slice = layer.w13_weight.shape[0] // self.moe_n_slice
