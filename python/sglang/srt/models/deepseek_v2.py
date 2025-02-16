@@ -81,7 +81,7 @@ else:
 import os
 g_tensor_data_dir = os.environ.get("SGLANG_TENSOR_DATA_DIR", None)
 first_n_layers = int(os.environ.get("SGLANG_SAVE_FIRST_N_LAYERS", 4))
-num_decoder_layers = int(os.environ.get("SGLANG_NUM_DECODER_LAYERS", 4))
+num_decoder_layers = int(os.environ.get("SGLANG_NUM_DECODER_LAYERS", -1))
 is_rank0 = get_tensor_model_parallel_rank() == 0
 curr_tensor_data_dir = None
 
@@ -858,7 +858,7 @@ class DeepseekV2Model(nn.Module):
                     layer_id,
                     quant_config=quant_config,
                 )
-                for layer_id in range(num_decoder_layers) # range(config.num_hidden_layers)
+                for layer_id in range(config.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
