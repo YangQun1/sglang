@@ -961,6 +961,9 @@ def init_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
 ):
+    torch._dynamo.config.cache_size_limit = 64
+    torch._dynamo.config.accumulated_cache_size_limit = 512
+
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
         world_size,

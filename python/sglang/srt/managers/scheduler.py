@@ -396,6 +396,7 @@ class Scheduler:
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
+                    torch.profiler.ProfilerActivity.HPU,
                 ],
                 with_stack=True,
             )

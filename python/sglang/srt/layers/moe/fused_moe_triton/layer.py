@@ -18,7 +18,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, permute_weight, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, permute_weight, set_weight_attrs, get_compiler_backend
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -215,6 +215,54 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             custom_routing_function,
             correction_bias,
         )
+
+    # TODO: try dynamic=True to reduce recompilation
+    @torch.compile(dynamic=False, backend=get_compiler_backend())
+    def forward_hpu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+    ) -> torch.Tensor:
+        # TODO: fix accuracy issue on HPU
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x.cpu(),
+            router_logits=router_logits.cpu(),
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias.cpu() if correction_bias is not None else None,
+            torch_native=True,
+        )
+        orig_device = router_logits.device
+        topk_weights, topk_ids = topk_weights.to(orig_device), topk_ids.to(orig_device)
+
+        len_experts = layer.num_experts
+
+        w13_list_slice = [layer.w13_weight[j] for j in range(len_experts)]
+        w2_list_slice = [layer.w2_weight[j] for j in range(len_experts)]
+
+        return torch.ops.hpu.mixture_of_experts(
+                    hidden_states=x,
+                    expert_routing_table=topk_ids.to(torch.int64),
+                    router_weights=topk_weights.to(x.dtype),
+                    w12=w13_list_slice,
+                    w3=w2_list_slice,
+                    permuted_weights=True,
+                    activation="silu",
+                    experts_min=0,
+                    experts_max=len_experts - 1)
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
