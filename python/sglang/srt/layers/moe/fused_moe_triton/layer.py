@@ -232,21 +232,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
     ) -> torch.Tensor:
-        # TODO: fix accuracy issue on HPU
         topk_weights, topk_ids = select_experts(
-            hidden_states=x.cpu(),
-            router_logits=router_logits.cpu(),
+            hidden_states=x,
+            router_logits=router_logits,
             use_grouped_topk=use_grouped_topk,
             top_k=top_k,
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias.cpu() if correction_bias is not None else None,
+            correction_bias=correction_bias,
             torch_native=True,
         )
-        orig_device = router_logits.device
-        topk_weights, topk_ids = topk_weights.to(orig_device), topk_ids.to(orig_device)
 
         len_experts = layer.num_experts
 
